@@ -1,0 +1,32 @@
+meta:
+  total_supply: 1000000000
+  tge_date: 2025-02-13  # Mainnet launch date
+
+allocations:
+  initial_incentives:
+    percent: 10.0
+    tge_percent: 100.0
+
+  foundation:
+    percent: 10.0
+    tge_percent: 50.0      # 5% of total supply at TGE
+    cliff_months: 12       # remaining 5% unlocks as a single cliff at 12 months
+    linear_months: 0
+
+  ecosystem_community:
+    percent: 38.4
+    tge_amount: 100000000  # absolute 100M unlocked at TGE
+    cliff_months: 0
+    linear_months: 48
+
+  early_backers:
+    percent: 21.6
+    tge_percent: 0.0
+    cliff_months: 12
+    linear_months: 36
+
+  core_contributors:
+    percent: 20.0
+    tge_percent: 0.0
+    cliff_months: 12
+    linear_months: 36

@@ -1,0 +1,18 @@
+POSTGRES_USER=xxxxx
+POSTGRES_PASSWORD=xxxxxx
+POSTGRES_DB=xxxxx
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+
+
+# Story RPC
+STORY_RPC_URL=
+
+# Postgres (libpq format for psql/psycopg)
+DATABASE_URL_PG=postgresql://xxxxx:xxxxx@localhost:5432/storyip
+
+# Backfill
+START_BLOCK=0 # leave 0 to auto-resolve from N days
+CONFIRMATIONS=12
+BATCH_BLOCKS=500
+TOP_HOLDER_SAMPLE=200 # top N to sample balances

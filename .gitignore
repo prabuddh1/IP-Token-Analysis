@@ -1,0 +1,55 @@
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# -------------------------
+# Environment / Config
+# -------------------------
+.env
+*.env
+config/*.yaml    # if you want to keep unlocks.yaml private (remove if safe to share)
+
+# -------------------------
+# Logs / temp files
+# -------------------------
+*.log
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Database
+# -------------------------
+*.sqlite
+*.db
+*.pgdata/
+postgres-data/
+
+# -------------------------
+# Streamlit
+# -------------------------
+.streamlit/
+
+# -------------------------
+# OS / IDE
+# -------------------------
+.vscode/
+.idea/
+*.iml
