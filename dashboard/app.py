@@ -1,68 +1,73 @@
+# dashboard/app.py
 import os
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine
 
-# ---------- Config ----------
+# ---------- Page / DB config ----------
+st.set_page_config(page_title="Story IP — Supply, Unlocks & Holders", layout="wide")
 DEFAULT_DB_URL = os.environ.get("DATABASE_URL_PG") or os.environ.get("DATABASE_URL") or ""
-st.set_page_config(page_title="Story IP – Supply & Unlocks", layout="wide")
 
-# ---------- Sidebar: DB connection ----------
 st.sidebar.header("Database")
-db_url = st.sidebar.text_input("Postgres URL", value=DEFAULT_DB_URL, help="e.g. postgresql://user:pass@127.0.0.1:5432/storyip")
+db_url = st.sidebar.text_input(
+    "Postgres URL",
+    value=DEFAULT_DB_URL,
+    help="E.g. postgresql://user:pass@127.0.0.1:5432/storyip",
+)
 if not db_url:
     st.warning("Set DATABASE_URL_PG in your environment or paste the Postgres URL in the sidebar.")
     st.stop()
 
-# Create engine (lazy); keep it simple for now
 engine = create_engine(db_url, pool_pre_ping=True)
 
 @st.cache_data(ttl=120)
 def q(sql: str) -> pd.DataFrame:
     return pd.read_sql(sql, engine)
 
-st.title("Story IP — Supply, Unlocks & Exchange Share (Part-1)")
+st.title("Story IP — Supply, Unlocks & Holders (Part-1)")
 
 # =========================================================
-# 1) Circulating vs Locked (as-of selector) + Stacked by category
+# 1) Circulating vs Locked (as-of selector) + category stack
 # =========================================================
 st.subheader("Circulating vs Locked")
-
 try:
     sup = q("select ts, total_supply_ip, circulating_ip, locked_ip from supply_timeseries order by ts;")
     if sup.empty:
         st.info("`supply_timeseries` is empty. Run `etl/unlocks.py` then `etl/supply.py`.")
     else:
         sup["ts"] = pd.to_datetime(sup["ts"]).dt.date
-
-        # horizon selector
         scope = st.radio("Horizon", ["As of today", "Full schedule", "Custom date"], horizontal=True)
 
         if scope == "As of today":
             horizon_date = pd.Timestamp.today().date()
         elif scope == "Custom date":
             default_dt = min(max(pd.Timestamp.today().date(), sup["ts"].min()), sup["ts"].max())
-            horizon_date = st.date_input("Select date", value=default_dt, min_value=sup["ts"].min(), max_value=sup["ts"].max())
+            horizon_date = st.date_input(
+                "Select date",
+                value=default_dt,
+                min_value=sup["ts"].min(),
+                max_value=sup["ts"].max(),
+            )
         else:
-            horizon_date = sup["ts"].max()  # full schedule through 2029-02-13
+            horizon_date = sup["ts"].max()  # full modeled schedule
 
-        # slice series up to horizon_date for the chart,
-        # but for metrics: use the snapshot at horizon (or nearest prior)
         sup_until = sup[sup["ts"] <= horizon_date]
         snap = sup_until.iloc[-1] if not sup_until.empty else sup.iloc[0]
 
-        k1, k2, k3, k4 = st.columns(4)
-        circ_pct = 100.0 * float(snap["circulating_ip"]) / float(snap["total_supply_ip"]) if float(snap["total_supply_ip"]) else 0.0
-        k1.metric("Total supply (IP)", f"{snap['total_supply_ip']:,.0f}")
-        k2.metric("Circulating (IP)", f"{snap['circulating_ip']:,.0f}")
-        k3.metric("Locked (IP)", f"{snap['locked_ip']:,.0f}")
-        k4.metric("Circulating (%)", f"{circ_pct:,.2f}%")
+        c1, c2, c3, c4 = st.columns(4)
+        total = float(snap["total_supply_ip"]) if snap["total_supply_ip"] is not None else 0.0
+        circ = float(snap["circulating_ip"]) if snap["circulating_ip"] is not None else 0.0
+        locked = float(snap["locked_ip"]) if snap["locked_ip"] is not None else 0.0
+        circ_pct = (100.0 * circ / total) if total else 0.0
+
+        c1.metric("Total supply (IP)", f"{total:,.0f}")
+        c2.metric("Circulating (IP)", f"{circ:,.0f}")
+        c3.metric("Locked (IP)", f"{locked:,.0f}")
+        c4.metric("Circulating (%)", f"{circ_pct:,.2f}%")
 
         st.line_chart(sup_until.set_index("ts")[["circulating_ip", "locked_ip"]])
 
-        # ---------- stacked by allocation (cumulative unlocked) ----------
         st.caption("Cumulative unlocked by allocation (same horizon)")
-        # Build cumulative per-category from unlock_schedule
         un = q("""
             select unlock_date::date as ts, category, amount_ip
             from unlock_schedule
@@ -72,12 +77,12 @@ try:
             un["ts"] = pd.to_datetime(un["ts"]).dt.date
             un = un[un["ts"] <= horizon_date]
             if not un.empty:
-                # daily sums then cumulative
-                pivot = (un.pivot_table(index="ts", columns="category", values="amount_ip", aggfunc="sum")
-                           .fillna(0.0)
-                           .sort_index())
-                cum = pivot.cumsum()
-                st.area_chart(cum)
+                pivot = (
+                    un.pivot_table(index="ts", columns="category", values="amount_ip", aggfunc="sum")
+                      .fillna(0.0)
+                      .sort_index()
+                )
+                st.area_chart(pivot.cumsum())
             else:
                 st.caption("No unlocks up to the selected horizon.")
         else:
@@ -86,76 +91,284 @@ except Exception as e:
     st.error(f"Failed to load/plot supply/unlocks: {e}")
 
 # =========================================================
-# 2) Upcoming unlocks (from unlock_schedule)
+# 2) Unlock Schedule (table + annotated timeline + category stacks)
 # =========================================================
-st.subheader("Unlock Schedule (Upcoming)")
+st.subheader("Unlock Schedule (Upcoming & Timeline)")
+
 try:
-    un_up = q("""
-        select unlock_date, category, basis, round(amount_ip, 2) as amount_ip
+    un_all = q("""
+        select unlock_date::date as ts, category, basis, amount_ip
         from unlock_schedule
-        where unlock_date >= current_date
-        order by unlock_date, category
-        limit 200;
+        order by ts, category
     """)
-    if un_up.empty:
-        st.info("No upcoming unlocks found (either all historical or table empty). Showing recent history instead.")
-        un_hist = q("""
-            select unlock_date, category, basis, round(amount_ip, 2) as amount_ip
-            from unlock_schedule
-            order by unlock_date desc, category
-            limit 200;
-        """)
-        st.dataframe(un_hist, use_container_width=True)
+    if un_all.empty:
+        st.info("`unlock_schedule` is empty.")
     else:
-        st.dataframe(un_up, use_container_width=True)
+        # --- Upcoming table ---
+        un_up = un_all[un_all["ts"] >= pd.Timestamp.today().date()].copy()
+        un_up["amount_ip"] = un_up["amount_ip"].round(2)
+        st.dataframe(un_up.rename(columns={"ts": "unlock_date"}), use_container_width=True)
+
+        # ---------- Chart A: Cumulative unlocked (all categories) with annotations ----------
+        daily = (
+            un_all.groupby("ts", as_index=False)["amount_ip"].sum()
+                  .sort_values("ts")
+        )
+        daily["cum_unlocked"] = daily["amount_ip"].cumsum()
+
+        tge_date = daily["ts"].min()
+        biggest = daily.loc[daily["amount_ip"].idxmax()]
+
+        def first_linear(cat: str):
+            df = un_all[(un_all["category"] == cat) &
+                        (un_all["basis"].str.lower().str.contains("linear"))]
+            return df["ts"].min() if not df.empty else None
+
+        first_linear_cc = first_linear("core_contributors")
+        first_linear_eb = first_linear("early_backers")
+
+        # --- Detect Foundation cliff (prefer from data; fallback to 2026-02-13) ---
+        foundation_cliff = None
+        try:
+            fnd = un_all[
+                (un_all["category"] == "foundation") &
+                (un_all["basis"].str.lower().isin(["cliff", "mixed"]))
+            ].sort_values("ts")
+            if not fnd.empty:
+                foundation_cliff = fnd["ts"].iloc[0]
+        except Exception:
+            pass
+        if foundation_cliff is None:
+            foundation_cliff = pd.to_datetime("2026-02-13").date()  # fallback
+
+        import altair as alt
+        base = alt.Chart(daily).encode(x=alt.X("ts:T", title="Date"))
+        area = base.mark_area(opacity=0.35).encode(y=alt.Y("cum_unlocked:Q", title="Cumulative Unlocked (IP)"))
+        line = base.mark_line().encode(y="cum_unlocked:Q")
+
+        def rule_label(xdate, text, dy=-6):
+            if xdate is None:
+                return alt.Chart(pd.DataFrame())  # empty layer
+            df = pd.DataFrame({"ts": [xdate], "label": [text]})
+            rule = alt.Chart(df).mark_rule(color="red").encode(x="ts:T")
+            txt = alt.Chart(df).mark_text(align="left", dx=6, dy=dy, color="red").encode(x="ts:T", y=alt.value(0), text="label:N")
+            return rule + txt
+
+        layers = area + line
+        # TGE
+        layers = layers + rule_label(tge_date, f"TGE ({tge_date})", dy=-10)
+        # Largest one-day unlock
+        if pd.notnull(biggest["ts"]):
+            layers = layers + rule_label(
+                biggest["ts"],
+                f"Largest 1-day: {int(round(biggest['amount_ip'])):,} IP",
+                dy=10
+            )
+        # Linear starts
+        if first_linear_cc:
+            layers = layers + rule_label(first_linear_cc, f"Core Contributors linear start ({first_linear_cc})", dy=-22)
+        if first_linear_eb:
+            layers = layers + rule_label(first_linear_eb, f"Early Backers linear start ({first_linear_eb})", dy=22)
+        # Foundation cliff (50M) marker
+        layers = layers + rule_label(foundation_cliff, f"Foundation cliff (≈50M) ({foundation_cliff})", dy=-34)
+
+        st.altair_chart(layers.properties(width="container", height=260), use_container_width=True)
+
+
+        # ---------- Chart B: Category-stacked cumulative + vesting-start markers ----------
+        # 1) daily per-category -> cumulative
+        cat_daily = (
+            un_all.groupby(["ts", "category"], as_index=False)["amount_ip"].sum()
+                  .sort_values(["ts", "category"])
+        )
+        wide = cat_daily.pivot(index="ts", columns="category", values="amount_ip").fillna(0.0)
+        wide_cum = wide.cumsum()
+        cum_long = (wide_cum.reset_index()
+                              .melt(id_vars="ts", var_name="category", value_name="cum_ip")
+                              .sort_values(["ts", "category"]))
+
+        stack = (
+            alt.Chart(cum_long)
+               .mark_area(opacity=0.6)
+               .encode(
+                   x=alt.X("ts:T", title="Date"),
+                   y=alt.Y("cum_ip:Q", title="Cumulative Unlocked (IP)"),
+                   color=alt.Color("category:N", title="Allocation")
+               )
+               .properties(width="container", height=280)
+        )
+
+        # 2) Vesting start per cohort = first linear day in that category
+        vesting_starts = []
+        for cat, grp in un_all.groupby("category", as_index=False):
+            lin = grp[grp["basis"].str.lower().str.contains("linear")]
+            if not lin.empty:
+                vesting_starts.append({"category": cat, "ts": lin["ts"].min()})
+
+        markers = alt.Chart(pd.DataFrame())
+        labels_layer = alt.Chart(pd.DataFrame())
+        if vesting_starts:
+            vest_df = pd.DataFrame(vesting_starts)
+            # join to get Y coordinate at that date
+            vest_join = vest_df.merge(cum_long, on=["ts", "category"], how="left")
+            # markers with tooltip (no overlap issue)
+            markers = (
+                alt.Chart(vest_join)
+                   .mark_point(filled=True, size=80, opacity=0.9)
+                   .encode(
+                       x="ts:T",
+                       y="cum_ip:Q",
+                       color="category:N",
+                       tooltip=[alt.Tooltip("category:N", title="Cohort"),
+                                alt.Tooltip("ts:T", title="Vesting start")]
+                   )
+            )
+
+            # add a few non-overlapping labels (limit to 6, stagger dy)
+            vest_join = vest_join.sort_values("ts").copy()
+            vest_join["label"] = vest_join["category"].str.replace("_", " ").str.title()
+            vest_join["dy"] = (vest_join.groupby("ts").cumcount() * 12) - 8
+            vest_limited = vest_join.head(6)
+
+            label_layers = []
+            for _, row in vest_limited.iterrows():
+                label_layers.append(
+                    alt.Chart(pd.DataFrame([row]))
+                       .mark_text(align="left", dx=6, dy=int(row["dy"]), color="#444")
+                       .encode(
+                           x="ts:T",
+                           y="cum_ip:Q",
+                           text=alt.value(row["label"]),
+                       )
+                )
+            if label_layers:
+                labels_layer = alt.layer(*label_layers)
+
+        st.altair_chart((stack + markers + labels_layer).resolve_scale(color="independent"), use_container_width=True)
+        st.caption("Stacked cumulative unlocks by allocation. Dots mark each cohort's **linear vesting start** (hover for exact date). Labels are limited and staggered to avoid overlap.")
+
 except Exception as e:
-    st.error(f"Failed to load unlock_schedule: {e}")
+    st.error(f"Failed to render unlock timeline: {e}")
 
 # =========================================================
-# 3) Exchange share & per-exchange balances
-#    Requires you to label a few CEX addresses in address_labels
-#    and refresh the materialized views from sql/views_part1.sql
+# 3) Exchange net flows (ALL CEX) — works without mviews
 # =========================================================
-st.subheader("Supply on Exchanges (Share of Circulating)")
-
-col_a, col_b = st.columns(2)
-
-with col_a:
-    try:
-        ex_share = q("""
-            select ts, circulating_ip, cex_ip, cex_pct_of_circ
-            from mv_exchange_share_daily
-            order by ts;
-        """)
-        if ex_share.empty:
-            st.info("`mv_exchange_share_daily` is empty. Seed CEX addresses in `address_labels` and refresh views.")
+st.subheader("Exchange Net Flows (ALL CEX)")
+try:
+    ex = q("""
+        select asof::date as asof, time_window, net_in_ip, unlock_proximity
+        from exchange_flows
+        where exchange = 'ALL'
+        order by asof
+    """)
+    if ex.empty:
+        st.info("No exchange flow rows yet. Seed a couple of CEX addresses in `config/cex_addresses.txt`, "
+                "then run: `python etl/labels_rules.py && python etl/flows.py`.")
+    else:
+        # pick a preferred available window
+        preferred_order = ["1d", "3d", "7d", "30d"]
+        have = [w for w in preferred_order if (ex["time_window"] == w).any()]
+        picked = have[0] if have else None
+        if picked:
+            exw = ex[ex.time_window == picked][["asof", "net_in_ip"]].set_index("asof")
+            st.line_chart(exw)
+            st.caption(f"Window: {picked}. Positive = net inflow to exchanges (potential sell pressure).")
         else:
-            latest = ex_share.iloc[-1]
-            st.metric("Latest % of circulating on exchanges", f"{latest['cex_pct_of_circ']:.2f}%")
-            st.line_chart(ex_share.set_index("ts")[["cex_pct_of_circ"]])
-    except Exception as e:
-        st.error(f"Failed to load mv_exchange_share_daily: {e}")
-
-with col_b:
-    try:
-        ex_bal = q("""
-            select ts, exchange, balance_ip
-            from mv_exchange_balance_daily
-            order by ts;
-        """)
-        if ex_bal.empty:
-            st.info("`mv_exchange_balance_daily` is empty. Label CEX addresses and refresh views.")
-        else:
-            # Pivot per-exchange balances into columns
-            pivot = ex_bal.pivot(index="ts", columns="exchange", values="balance_ip").fillna(0.0)
-            st.area_chart(pivot)
-    except Exception as e:
-        st.error(f"Failed to load mv_exchange_balance_daily: {e}")
+            st.info("No recognized windows found in `exchange_flows`.")
+except Exception as e:
+    st.error(f"Exchange flows failed: {e}")
 
 # =========================================================
-# 4) Post-unlock behavior: sold vs held (7d)
-#    -> requires: etl/unlock_attribution.py done (realized_unlocks populated)
-#    -> query from sql/unlock_post_event.sql
+# 4) Concentration: Top10/Top50 + separate Gini / HHI
+# =========================================================
+st.subheader("Holder Concentration")
+try:
+    conc = q("select ts, top10_share, top50_share, hhi, gini from concentration_timeseries order by ts;")
+    if conc.empty:
+        st.info("Run `python etl/balances_latest.py --days 7` then `python etl/concentration.py --all`.")
+    else:
+        # Ensure proper dtypes
+        conc["ts"] = pd.to_datetime(conc["ts"])
+        for col in ["top10_share", "top50_share", "hhi", "gini"]:
+            conc[col] = pd.to_numeric(conc[col], errors="coerce")
+
+        latest = conc.iloc[-1]
+
+        # Metrics row: only Top10 / Top50 here
+        m1, m2 = st.columns(2)
+        m1.metric("Top 10 share", f"{float(latest['top10_share']):.2f}%")
+        m2.metric("Top 50 share", f"{float(latest['top50_share']):.2f}%")
+
+        # Chart 1: percentage shares
+        st.line_chart(conc.set_index("ts")[["top10_share", "top50_share"]])
+
+        # Two-column layout for Gini and HHI charts + local metrics
+        c_left, c_right = st.columns(2)
+
+        with c_left:
+            st.markdown("**Gini (inequality of balances)**")
+            if conc["gini"].notnull().any():
+                st.line_chart(conc.set_index("ts")[["gini"]])
+                gval = float(latest["gini"]) if pd.notnull(latest["gini"]) else None
+                st.metric("Latest Gini (%)", f"{gval:.2f}%" if gval is not None else "—")
+            else:
+                st.info("Gini is empty. Run `python etl/concentration.py --all` to populate.")
+
+        with c_right:
+            st.markdown("**HHI (0–10,000 scale)**")
+            st.line_chart(conc.set_index("ts")[["hhi"]])
+            st.metric("Latest HHI", f"{float(latest['hhi']):.0f}")
+
+except Exception as e:
+    st.error(f"Concentration failed: {e}")
+
+st.caption(
+    "Note: Concentration metrics (Top10/Top50, HHI, Gini) are computed from a "
+    "30-day backfill (Aug 2025). This means only addresses active during this "
+    "period are included. Dormant large holders who received allocations at TGE "
+    "(Feb 2025) but have not moved tokens recently are not fully captured. "
+    "As a result, values are directionally correct (showing heavy concentration "
+    "among a few addresses) but may understate total balances of early investors/foundation. "
+    "Full history backfill from TGE would refine these metrics."
+)
+
+# =========================================================
+# 5) Top holders (today) with labels & behavior flags
+# =========================================================
+st.subheader("Top Holders (with Labels & Flags)")
+try:
+    holders = q("""
+        with d as (select max(asof) as asof from top_holders_snapshot),
+        flags as (
+          select address, string_agg(distinct flag, ', ' order by flag) as flags
+          from holder_flags
+          where asof = current_date
+          group by 1
+        )
+        select th.rnk,
+               '0x'||encode(th.address,'hex') as address,
+               round(th.balance_ip,4) as balance_ip,
+               coalesce(al.label,'') as label,
+               coalesce(al.category,'unknown') as category,
+               coalesce(al.confidence,'') as confidence,
+               coalesce(flags.flags,'') as flags
+        from top_holders_snapshot th
+        left join address_labels al on al.address = th.address
+        left join flags on flags.address = th.address
+        where th.asof = (select asof from d)
+        order by th.rnk
+        limit 50;
+    """)
+    if holders.empty:
+        st.info("Run `python etl/balances_latest.py` then `python etl/concentration.py` "
+                "to populate top holders; run `python etl/flags.py` to add behavior flags.")
+    else:
+        st.dataframe(holders, use_container_width=True)
+except Exception as e:
+    st.error(f"Top holders failed: {e}")
+
+# =========================================================
+# 6) Post-unlock behavior (optional; needs realized_unlocks + CEX labels)
 # =========================================================
 st.subheader("Post-Unlock Behavior (Sell-Through in 7 days)")
 try:
@@ -206,10 +419,36 @@ try:
         order by ru.unlock_date desc, ru.category;
     """)
     if post.empty:
-        st.info("`realized_unlocks` appears empty. Run:\n\n`python etl/unlock_attribution.py --pre-days 1 --post-days 1 --min-ip 25000`\n\nThen refresh this page.")
+        st.info("`realized_unlocks` appears empty or no CEX labels. Populate via:\n"
+                "`python etl/unlock_attribution.py --pre-days 1 --post-days 1 --min-ip 25000` "
+                "and seed a few CEX addresses, then rerun.")
     else:
         st.dataframe(post, use_container_width=True)
 except Exception as e:
     st.error(f"Failed to compute post-unlock behavior: {e}")
 
-st.caption("Tip: Update `address_labels` (CEX / treasury / vesting) and refresh the materialized views to improve accuracy.")
+# =========================================================
+# 7) Data health (quick debug)
+# =========================================================
+with st.expander("Data health (debug)"):
+    try:
+        def exists(table):
+            return not q(f"select 1 from information_schema.tables where table_name='{table}';").empty
+
+        counts = {
+            "blocks": q("select count(*) c from blocks;")["c"].iloc[0] if exists("blocks") else 0,
+            "transactions": q("select count(*) c from transactions;")["c"].iloc[0] if exists("transactions") else 0,
+            "ip_transfers": q("select count(*) c from ip_transfers;")["c"].iloc[0] if exists("ip_transfers") else 0,
+            "balances_latest": q("select count(*) c from balances_latest;")["c"].iloc[0] if exists("balances_latest") else 0,
+            "top_holders_snapshot": q("select count(*) c from top_holders_snapshot;")["c"].iloc[0] if exists("top_holders_snapshot") else 0,
+            "concentration_timeseries": q("select count(*) c from concentration_timeseries;")["c"].iloc[0] if exists("concentration_timeseries") else 0,
+            "exchange_flows": q("select count(*) c from exchange_flows;")["c"].iloc[0] if exists("exchange_flows") else 0,
+            "address_labels": q("select count(*) c from address_labels;")["c"].iloc[0] if exists("address_labels") else 0,
+            "holder_flags": q("select count(*) c from holder_flags;")["c"].iloc[0] if exists("holder_flags") else 0,
+            "unlock_schedule": q("select count(*) c from unlock_schedule;")["c"].iloc[0] if exists("unlock_schedule") else 0,
+            "supply_timeseries": q("select count(*) c from supply_timeseries;")["c"].iloc[0] if exists("supply_timeseries") else 0,
+            "realized_unlocks": q("select count(*) c from realized_unlocks;")["c"].iloc[0] if exists("realized_unlocks") else 0,
+        }
+        st.json(counts)
+    except Exception as e:
+        st.write(f"Health check error: {e}")
