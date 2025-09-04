@@ -2,7 +2,7 @@
 import os
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 # ---------- Page / DB config ----------
 st.set_page_config(page_title="Story IP — Supply, Unlocks & Holders", layout="wide")
@@ -21,10 +21,11 @@ if not db_url:
 engine = create_engine(db_url, pool_pre_ping=True)
 
 @st.cache_data(ttl=120)
-def q(sql: str) -> pd.DataFrame:
-    return pd.read_sql(sql, engine)
+def q(sql: str, params: dict | None = None) -> pd.DataFrame:
+    with engine.connect() as conn:
+        return pd.read_sql(text(sql), conn, params=params)
 
-st.title("Story IP — Supply, Unlocks & Holders (Part-1)")
+st.title("Story IP — Supply, Unlocks & Holders")
 
 # =========================================================
 # 1) Circulating vs Locked (as-of selector) + category stack
@@ -251,7 +252,7 @@ except Exception as e:
     st.error(f"Failed to render unlock timeline: {e}")
 
 # =========================================================
-# 3) Exchange net flows (ALL CEX) — works without mviews
+# 3) Exchange net flows (ALL CEX) — daily vs cumulative (step)
 # =========================================================
 st.subheader("Exchange Net Flows (ALL CEX)")
 try:
@@ -262,19 +263,65 @@ try:
         order by asof
     """)
     if ex.empty:
-        st.info("No exchange flow rows yet. Seed a couple of CEX addresses in `config/cex_addresses.txt`, "
-                "then run: `python etl/labels_rules.py && python etl/flows.py`.")
+        st.info(
+            "No exchange flow rows yet. Seed a couple of CEX addresses in `config/cex_addresses.txt`, "
+            "then run: `python etl/labels_rules.py && python etl/flows.py`."
+        )
     else:
-        # pick a preferred available window
-        preferred_order = ["1d", "3d", "7d", "30d"]
-        have = [w for w in preferred_order if (ex["time_window"] == w).any()]
-        picked = have[0] if have else None
-        if picked:
-            exw = ex[ex.time_window == picked][["asof", "net_in_ip"]].set_index("asof")
-            st.line_chart(exw)
-            st.caption(f"Window: {picked}. Positive = net inflow to exchanges (potential sell pressure).")
+        # --- choose window (prefer 1d>3d>7d>30d if available), but let user override
+        windows_present = sorted(ex["time_window"].unique(), key=lambda w: ["1d","3d","7d","30d"].index(w) if w in ["1d","3d","7d","30d"] else 99)
+        picked = st.radio("Window", windows_present, index=0, horizontal=True)
+
+        exw = (
+            ex.loc[ex["time_window"] == picked, ["asof", "net_in_ip"]]
+              .dropna()
+              .sort_values("asof")
+              .reset_index(drop=True)
+        )
+        if exw.empty:
+            st.info(f"No rows for window {picked}.")
         else:
-            st.info("No recognized windows found in `exchange_flows`.")
+            # Chart selector
+            mode = st.radio("View", ["Daily net flow (bars)", "Cumulative (step)"], horizontal=True)
+
+            import altair as alt
+            exw_ren = exw.rename(columns={"asof": "date", "net_in_ip": "net_in_ip"})
+            exw_ren["cum_in_ip"] = exw_ren["net_in_ip"].cumsum()
+
+            if mode == "Daily net flow (bars)":
+                chart = (
+                    alt.Chart(exw_ren)
+                       .mark_bar()
+                       .encode(
+                           x=alt.X("date:T", title="Date"),
+                           y=alt.Y("net_in_ip:Q", title="Net flow to exchanges (IP/day)"),
+                           tooltip=[
+                               alt.Tooltip("date:T", title="Date"),
+                               alt.Tooltip("net_in_ip:Q", title="Net flow (IP)", format=",.2f"),
+                           ],
+                       )
+                       .properties(width="container", height=260)
+                )
+                st.altair_chart(chart, use_container_width=True)
+                st.caption(f"Window: **{picked}**. Bars show *per-day* net flow. "
+                           "Positive = net inflow to exchanges (potential sell pressure); negative = withdrawals.")
+            else:
+                chart = (
+                    alt.Chart(exw_ren)
+                       .mark_line(interpolate="step-after")
+                       .encode(
+                           x=alt.X("date:T", title="Date"),
+                           y=alt.Y("cum_in_ip:Q", title="Cumulative net flow to exchanges (IP)"),
+                           tooltip=[
+                               alt.Tooltip("date:T", title="Date"),
+                               alt.Tooltip("cum_in_ip:Q", title="Cumulative (IP)", format=",.2f"),
+                           ],
+                       )
+                       .properties(width="container", height=260)
+                )
+                st.altair_chart(chart, use_container_width=True)
+                st.caption(f"Window: **{picked}**. Step line shows *cumulative* net flow (sum of daily values). "
+                           "A rising step means sustained net deposits to exchanges; flat/declining means neutral/withdrawals.")
 except Exception as e:
     st.error(f"Exchange flows failed: {e}")
 
@@ -368,9 +415,72 @@ except Exception as e:
     st.error(f"Top holders failed: {e}")
 
 # =========================================================
-# 6) Post-unlock behavior (optional; needs realized_unlocks + CEX labels)
+# 6) Manually Identified Exchange Clusters (from probes)
+# =========================================================
+st.subheader("Probe Findings — CEX HOT & Treasuries (All Labeled)")
+
+try:
+    probe = q("""
+        with latest as (
+          select max(sampled_at) ts from balances_latest
+        ),
+        bal as (
+          select address, balance_ip
+          from balances_latest
+          where sampled_at = (select ts from latest)
+        ),
+        labs as (
+          select address, label, category, coalesce(confidence,'') confidence
+          from address_labels
+          where category in ('cex','cex_cluster')
+        ),
+        enriched as (
+          select
+            case
+              when category='cex'         then split_part(label,'_',3)
+              when category='cex_cluster' then split_part(label,':',1)
+              else '' end                                         as exchange,
+            case
+              when category='cex'         then 'HOT'
+              when category='cex_cluster' then split_part(label,':',2)
+              else '' end                                         as cluster,
+            case
+              when category='cex'         then 'HOT'
+              when category='cex_cluster' then coalesce(nullif(split_part(label,':',3),''),'CLUSTER')
+              else '' end                                         as role,
+            '0x'||encode(l.address,'hex')                         as address,
+            round(greatest(coalesce(b.balance_ip,0),0)::numeric, 2) as balance_ip,
+            label, category, confidence
+          from labs l
+          left join bal b on b.address = l.address
+        )
+        select *
+        from enriched
+        order by
+          exchange nulls last,
+          cluster  nulls last,
+          case when category='cex' then 0 else 1 end,
+          balance_ip desc nulls last;
+    """)
+    if probe.empty:
+        st.info("No manually seeded clusters found.\n\n• Keep only HOT wallets in `config/cex_addresses.txt`\n• Run: `python etl/labels_rules.py`\n• (Optional) Add treasuries/cluster edges with INSERTs into `address_labels`.")
+    else:
+        st.dataframe(probe, use_container_width=True)
+except Exception as e:
+    st.error(f"Exchange clusters failed: {e}")
+
+st.caption(
+    "Balances here reflect **net flows over the backfill window (August 2025)**, not full token history. "
+    "Some exchange or cluster wallets may appear as `0` because their main activity happened "
+    "before the backfill period. Negative balances were clamped to `0` for interpretability. "
+    "Clusters and HOT wallets shown here were identified via manual **probe queries**."
+)
+
+# =========================================================
+# 7) Post-unlock behavior (optional; needs realized_unlocks + CEX labels)
 # =========================================================
 st.subheader("Post-Unlock Behavior (Sell-Through in 7 days)")
+
 try:
     post = q("""
         with params as (select 7::int as days),
@@ -418,12 +528,23 @@ try:
         left join benef_net       on (benef_net.unlock_date,benef_net.category,benef_net.beneficiary)=(ru.unlock_date,ru.category,ru.beneficiary)
         order by ru.unlock_date desc, ru.category;
     """)
+
     if post.empty:
-        st.info("`realized_unlocks` appears empty or no CEX labels. Populate via:\n"
-                "`python etl/unlock_attribution.py --pre-days 1 --post-days 1 --min-ip 25000` "
-                "and seed a few CEX addresses, then rerun.")
+        st.info(
+            "No unlock events fall inside the current 30-day backfill window, so post-unlock sell-through is "
+            "**not applicable** for this dataset. The next major Story unlock (Foundation 5% cliff + vesting start) "
+            "is scheduled for **Feb 13, 2026**, which is outside the data window shown here. "
+            "See the Unlock Schedule charts above for upcoming events."
+        )
+        with st.expander("How to demo this section (optional)"):
+            st.markdown(
+                "- Add a mock row into `realized_unlocks` for a recent date and a known beneficiary, **or**\n"
+                "- Backfill chain data that spans Feb 2026 (and ideally traces) so real unlocks can be attributed.\n\n"
+                "Once `realized_unlocks` has data and a few CEX labels exist, this table will populate automatically."
+            )
     else:
         st.dataframe(post, use_container_width=True)
+
 except Exception as e:
     st.error(f"Failed to compute post-unlock behavior: {e}")
 
