@@ -477,76 +477,90 @@ st.caption(
 )
 
 # =========================================================
-# 7) Post-unlock behavior (optional; needs realized_unlocks + CEX labels)
+# 7) Post-unlock behavior (Sell-Through in 7 days)
 # =========================================================
 st.subheader("Post-Unlock Behavior (Sell-Through in 7 days)")
 
 try:
-    post = q("""
-        with params as (select 7::int as days),
-        ru as (
-          select r.unlock_date, r.category, r.dst_address as beneficiary, r.amount_wei,
-                 b.timestamp as unlock_ts
-          from realized_unlocks r
-          join transactions t on t.hash = r.tx_hash
-          join blocks b on b.number = t.block_number
-        ),
-        cex as (select address from address_labels where category='cex'),
-        benef_to_cex as (
-          select ru.unlock_date, ru.category, ru.beneficiary, sum(it.value_wei) as to_cex_wei
-          from ru
-          join ip_transfers it on it.from_address = ru.beneficiary
-          join blocks b2 on b2.number = it.block_number
-          join params p on true
-          where it.to_address in (select address from cex)
-            and b2.timestamp >= ru.unlock_ts
-            and b2.timestamp <  ru.unlock_ts + (p.days || ' days')::interval
-          group by 1,2,3
-        ),
-        benef_net as (
-          select ru.unlock_date, ru.category, ru.beneficiary,
-                 sum(case when it.to_address   = ru.beneficiary then it.value_wei else 0 end) -
-                 sum(case when it.from_address = ru.beneficiary then it.value_wei else 0 end) as net_wei
-          from ru
-          join ip_transfers it on (it.from_address = ru.beneficiary or it.to_address = ru.beneficiary)
-          join blocks b2 on b2.number = it.block_number
-          join params p on true
-          where b2.timestamp >= ru.unlock_ts
-            and b2.timestamp <  ru.unlock_ts + (p.days || ' days')::interval
-          group by 1,2,3
-        )
-        select
-          to_char(ru.unlock_date,'YYYY-MM-DD') as unlock_date,
-          ru.category,
-          '0x'||encode(ru.beneficiary,'hex')   as beneficiary,
-          round(ru.amount_wei/1e18, 4)         as unlocked_ip,
-          round(coalesce(bc.to_cex_wei,0)/1e18, 4) as to_cex_ip_7d,
-          round(100.0*coalesce(bc.to_cex_wei,0)/ru.amount_wei, 4) as sell_through_pct_of_unlock,
-          round((coalesce(ru.amount_wei,0) + coalesce(benef_net.net_wei,0))/1e18, 4) as held_or_net_change_ip_7d
-        from ru
-        left join benef_to_cex bc on (bc.unlock_date,bc.category,bc.beneficiary)=(ru.unlock_date,ru.category,ru.beneficiary)
-        left join benef_net       on (benef_net.unlock_date,benef_net.category,benef_net.beneficiary)=(ru.unlock_date,ru.category,ru.beneficiary)
-        order by ru.unlock_date desc, ru.category;
-    """)
+    # check if realized_unlocks exists
+    exists = not q("""
+        select 1 from information_schema.tables 
+        where table_name='realized_unlocks';
+    """).empty
 
-    if post.empty:
+    if exists:
+        post = q(""" 
+            -- same query as before for sell-through calc
+            with params as (select 7::int as days),
+            ru as (
+              select r.unlock_date, r.category, r.dst_address as beneficiary, r.amount_wei,
+                     b.timestamp as unlock_ts
+              from realized_unlocks r
+              join transactions t on t.hash = r.tx_hash
+              join blocks b on b.number = t.block_number
+            ),
+            cex as (select address from address_labels where category='cex'),
+            benef_to_cex as (
+              select ru.unlock_date, ru.category, ru.beneficiary, sum(it.value_wei) as to_cex_wei
+              from ru
+              join ip_transfers it on it.from_address = ru.beneficiary
+              join blocks b2 on b2.number = it.block_number
+              join params p on true
+              where it.to_address in (select address from cex)
+                and b2.timestamp >= ru.unlock_ts
+                and b2.timestamp <  ru.unlock_ts + (p.days || ' days')::interval
+              group by 1,2,3
+            ),
+            benef_net as (
+              select ru.unlock_date, ru.category, ru.beneficiary,
+                     sum(case when it.to_address   = ru.beneficiary then it.value_wei else 0 end) -
+                     sum(case when it.from_address = ru.beneficiary then it.value_wei else 0 end) as net_wei
+              from ru
+              join ip_transfers it on (it.from_address = ru.beneficiary or it.to_address = ru.beneficiary)
+              join blocks b2 on b2.number = it.block_number
+              join params p on true
+              where b2.timestamp >= ru.unlock_ts
+                and b2.timestamp <  ru.unlock_ts + (p.days || ' days')::interval
+              group by 1,2,3
+            )
+            select
+              to_char(ru.unlock_date,'YYYY-MM-DD') as unlock_date,
+              ru.category,
+              '0x'||encode(ru.beneficiary,'hex')   as beneficiary,
+              round(ru.amount_wei/1e18, 4)         as unlocked_ip,
+              round(coalesce(bc.to_cex_wei,0)/1e18, 4) as to_cex_ip_7d,
+              round(100.0*coalesce(bc.to_cex_wei,0)/ru.amount_wei, 4) as sell_through_pct_of_unlock,
+              round((coalesce(ru.amount_wei,0) + coalesce(benef_net.net_wei,0))/1e18, 4) as held_or_net_change_ip_7d
+            from ru
+            left join benef_to_cex bc on (bc.unlock_date,bc.category,bc.beneficiary)=(ru.unlock_date,ru.category,ru.beneficiary)
+            left join benef_net       on (benef_net.unlock_date,benef_net.category,benef_net.beneficiary)=(ru.unlock_date,ru.category,ru.beneficiary)
+            order by ru.unlock_date desc, ru.category;
+        """)
+
+        if not post.empty:
+            st.dataframe(post, use_container_width=True)
+        else:
+            st.info(
+                "No unlock events fall inside the current 30-day backfill window, so post-unlock sell-through is "
+                "**not applicable** for this dataset. The next major Story unlock (Foundation 5% cliff + vesting start) "
+                "is scheduled for **Feb 13, 2026**. See the Unlock Schedule charts above for upcoming events."
+            )
+    else:
         st.info(
             "No unlock events fall inside the current 30-day backfill window, so post-unlock sell-through is "
             "**not applicable** for this dataset. The next major Story unlock (Foundation 5% cliff + vesting start) "
-            "is scheduled for **Feb 13, 2026**, which is outside the data window shown here. "
-            "See the Unlock Schedule charts above for upcoming events."
+            "is scheduled for **Feb 13, 2026**. See the Unlock Schedule charts above for upcoming events."
         )
-        with st.expander("How to demo this section (optional)"):
-            st.markdown(
-                "- Add a mock row into `realized_unlocks` for a recent date and a known beneficiary, **or**\n"
-                "- Backfill chain data that spans Feb 2026 (and ideally traces) so real unlocks can be attributed.\n\n"
-                "Once `realized_unlocks` has data and a few CEX labels exist, this table will populate automatically."
-            )
-    else:
-        st.dataframe(post, use_container_width=True)
+
+    with st.expander("How to demo this section (optional)"):
+        st.markdown(
+            "- Add a mock row into `realized_unlocks` for a recent date and a known beneficiary, **or**\n"
+            "- Backfill chain data that spans Feb 2026 (and ideally traces) so real unlocks can be attributed.\n\n"
+            "Once `realized_unlocks` has data and a few CEX labels exist, this table will populate automatically."
+        )
 
 except Exception as e:
-    st.error(f"Failed to compute post-unlock behavior: {e}")
+    st.error(f"Post-unlock section failed: {e}")
 
 # =========================================================
 # 7) Data health (quick debug)
