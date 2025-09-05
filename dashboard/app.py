@@ -385,32 +385,59 @@ st.caption(
 st.subheader("Top Holders (with Labels & Flags)")
 try:
     holders = q("""
-        with d as (select max(asof) as asof from top_holders_snapshot),
-        flags as (
+        with d as (
+          select max(asof) as asof
+          from top_holders_snapshot
+        ),
+        -- flags for the SAME snapshot date as top_holders
+        flags_on_day as (
           select address, string_agg(distinct flag, ', ' order by flag) as flags
           from holder_flags
-          where asof = current_date
+          where asof = (select asof from d)
           group by 1
+        ),
+        -- optional fallback: if an address has no flags on that day, use its latest known flags
+        latest_flag_dt as (
+          select address, max(asof) as asof
+          from holder_flags
+          group by 1
+        ),
+        flags_latest as (
+          select f.address, string_agg(distinct f.flag, ', ' order by f.flag) as flags
+          from holder_flags f
+          join latest_flag_dt lf
+            on lf.address = f.address and lf.asof = f.asof
+          group by f.address
         )
-        select th.rnk,
-               '0x'||encode(th.address,'hex') as address,
-               round(th.balance_ip,4) as balance_ip,
-               coalesce(al.label,'') as label,
-               coalesce(al.category,'unknown') as category,
-               coalesce(al.confidence,'') as confidence,
-               coalesce(flags.flags,'') as flags
+        select
+          th.rnk,
+          '0x'||encode(th.address,'hex')                        as address,
+          round(th.balance_ip, 4)                               as balance_ip,
+          coalesce(al.label,'')                                 as label,
+          coalesce(al.category,'unknown')                       as category,
+          coalesce(al.confidence,'')                            as confidence,
+          -- prefer flags_on_day; if missing, fall back to flags_latest
+          coalesce(fd.flags, fl.flags, '')                      as flags
         from top_holders_snapshot th
-        left join address_labels al on al.address = th.address
-        left join flags on flags.address = th.address
+        left join address_labels al  on al.address = th.address
+        left join flags_on_day fd    on fd.address = th.address
+        left join flags_latest fl    on fl.address = th.address
         where th.asof = (select asof from d)
         order by th.rnk
         limit 50;
     """)
     if holders.empty:
-        st.info("Run `python etl/balances_latest.py` then `python etl/concentration.py` "
-                "to populate top holders; run `python etl/flags.py` to add behavior flags.")
+        st.info(
+            "No top holders found for the latest snapshot. "
+            "Run `python etl/balances_latest.py --days 7` then `python etl/concentration.py --all`. "
+            "Run `python etl/flags.py` to compute behavior flags."
+        )
     else:
         st.dataframe(holders, use_container_width=True)
+        st.caption(
+            "Flags are aligned to the snapshot date. If a holder had no flags on that day, "
+            "the latest available flags are shown as a fallback."
+        )
 except Exception as e:
     st.error(f"Top holders failed: {e}")
 
